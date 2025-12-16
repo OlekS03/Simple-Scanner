@@ -14,35 +14,49 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
+class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   List<File> pdfFiles = [];
   late Directory pdfDir;
 
   GoogleSignInAccount? _currentUser;
   late GoogleSignIn _googleSignIn;
 
+  // Track uploaded files to avoid duplicates
+  Map<String, String> uploadedFileIds = {}; // local path -> Drive file ID
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
 
-    // Initialize Google Sign-In with Drive scope
     _googleSignIn = GoogleSignIn(
       scopes: [drive.DriveApi.driveFileScope],
     );
 
-    // Listen for login changes
     _googleSignIn.onCurrentUserChanged.listen((account) {
-      _currentUser = account;
-      if (account != null) {
-        _uploadAllPdfsToDrive();
+      setState(() {
+        _currentUser = account;
+      });
+      if (_currentUser != null) {
+        _syncPdfsToDrive();
       }
-      setState(() {}); // Refresh UI
     });
 
-    // Try silent sign-in to remember user
     _googleSignIn.signInSilently();
-
     _loadPdfFiles();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _syncPdfsToDrive();
+    }
   }
 
   Future<void> _loadPdfFiles() async {
@@ -62,6 +76,9 @@ class _HomePageState extends State<HomePage> {
       ..sort((a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
 
     setState(() {});
+
+    // Sync after loading files
+    _syncPdfsToDrive();
   }
 
   void _confirmDeletePdf(File file) {
@@ -69,8 +86,7 @@ class _HomePageState extends State<HomePage> {
       context: context,
       builder: (context) => AlertDialog(
         title: const Text("Delete PDF"),
-        content: Text(
-            "Are you sure you want to delete '${file.path.split("/").last}'?"),
+        content: Text("Are you sure you want to delete '${file.path.split("/").last}'?"),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context),
@@ -79,6 +95,7 @@ class _HomePageState extends State<HomePage> {
           TextButton(
             onPressed: () {
               file.deleteSync();
+              uploadedFileIds.remove(file.path); // Remove from uploaded tracking
               _loadPdfFiles();
               Navigator.pop(context);
             },
@@ -102,7 +119,6 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  /// Login with Google
   Future<void> _loginWithGoogle() async {
     try {
       await _googleSignIn.signIn();
@@ -111,36 +127,38 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  /// Logout from Google
-  Future<void> _logoutFromGoogle() async {
+  Future<void> _logoutGoogle() async {
     await _googleSignIn.disconnect();
-    _currentUser = null;
-    setState(() {});
+    setState(() {
+      _currentUser = null;
+      uploadedFileIds.clear();
+    });
   }
 
-  /// Upload a single PDF file to Google Drive into the folder "Simple Scanner PDF"
   Future<void> _uploadPdfToDrive(File file) async {
     if (_currentUser == null) return;
 
-    final authHeaders = await _currentUser!.authHeaders;
-    final client = GoogleAuthClient(authHeaders);
-    final driveApi = drive.DriveApi(client);
+    // Already uploaded?
+    if (uploadedFileIds.containsKey(file.path)) return;
 
-    // Ensure folder exists
+    final authHeaders = await _currentUser!.authHeaders;
+    final authenticateClient = GoogleAuthClient(authHeaders);
+    final driveApi = drive.DriveApi(authenticateClient);
+
     String folderId = await _getOrCreateFolder(driveApi, "Simple Scanner PDF");
 
-    // Upload file
     final pdfFile = drive.File()
       ..name = file.path.split("/").last
       ..parents = [folderId];
 
-    await driveApi.files.create(
+    final createdFile = await driveApi.files.create(
       pdfFile,
       uploadMedia: drive.Media(file.openRead(), file.lengthSync()),
     );
+
+    uploadedFileIds[file.path] = createdFile.id!;
   }
 
-  /// Check if folder exists, create if not
   Future<String> _getOrCreateFolder(drive.DriveApi driveApi, String folderName) async {
     final folderList = await driveApi.files.list(
       q: "mimeType='application/vnd.google-apps.folder' and name='$folderName'",
@@ -159,12 +177,12 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  /// Upload all PDFs automatically (after login or app start)
-  Future<void> _uploadAllPdfsToDrive() async {
+  Future<void> _syncPdfsToDrive() async {
+    if (_currentUser == null) return;
+
     for (final file in pdfFiles) {
       await _uploadPdfToDrive(file);
     }
-    print("All PDFs uploaded to Google Drive!");
   }
 
   @override
@@ -182,38 +200,16 @@ class _HomePageState extends State<HomePage> {
             icon: const Icon(Icons.login),
             onPressed: _loginWithGoogle,
           )
-              : GestureDetector(
-            onTap: () {
-              // Show logout option
-              showDialog(
-                context: context,
-                builder: (context) => AlertDialog(
-                  title: const Text("Logout"),
-                  content:
-                  const Text("Do you want to logout from Google?"),
-                  actions: [
-                    TextButton(
-                      onPressed: () => Navigator.pop(context),
-                      child: const Text("Cancel"),
-                    ),
-                    TextButton(
-                      onPressed: () {
-                        _logoutFromGoogle();
-                        Navigator.pop(context);
-                      },
-                      child:
-                      const Text("Logout", style: TextStyle(color: Colors.red)),
-                    ),
-                  ],
+              : Row(
+            children: [
+              GestureDetector(
+                onTap: _logoutGoogle,
+                child: CircleAvatar(
+                  backgroundImage: NetworkImage(_currentUser!.photoUrl ?? ""),
                 ),
-              );
-            },
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              child: CircleAvatar(
-                backgroundImage: NetworkImage(_currentUser!.photoUrl ?? ""),
               ),
-            ),
+              const SizedBox(width: 8),
+            ],
           ),
         ],
       ),
@@ -228,13 +224,10 @@ class _HomePageState extends State<HomePage> {
         itemCount: pdfFiles.length,
         itemBuilder: (context, index) {
           final file = pdfFiles[index];
-
           return Card(
-            margin:
-            const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
             child: ListTile(
-              leading: const Icon(Icons.picture_as_pdf,
-                  size: 40, color: Colors.red),
+              leading: const Icon(Icons.picture_as_pdf, size: 40, color: Colors.red),
               title: Text(
                 file.path.split("/").last,
                 maxLines: 1,
@@ -249,19 +242,16 @@ class _HomePageState extends State<HomePage> {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   IconButton(
-                    icon:
-                    const Icon(Icons.delete, color: Colors.red),
+                    icon: const Icon(Icons.delete, color: Colors.red),
                     onPressed: () => _confirmDeletePdf(file),
                   ),
                   IconButton(
-                    icon:
-                    const Icon(Icons.share, color: Colors.blue),
+                    icon: const Icon(Icons.share, color: Colors.blue),
                     onPressed: () => _sharePdf(file),
                   ),
                   if (_currentUser != null)
                     IconButton(
-                      icon: const Icon(Icons.cloud_upload,
-                          color: Colors.green),
+                      icon: const Icon(Icons.cloud_upload, color: Colors.green),
                       onPressed: () => _uploadPdfToDrive(file),
                     ),
                 ],
@@ -274,7 +264,6 @@ class _HomePageState extends State<HomePage> {
   }
 }
 
-/// Helper class for authenticated HTTP client
 class GoogleAuthClient extends http.BaseClient {
   final Map<String, String> _headers;
   final http.Client _client = http.Client();
